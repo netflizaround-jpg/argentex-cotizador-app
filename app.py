@@ -25,7 +25,7 @@ async def lifespan(app):
     init()
     yield
 
-app=FastAPI(title='Argentex Cotizador App', version='1.2.0', lifespan=lifespan)
+app=FastAPI(title='Argentex Cotizador App', version='1.3.0', lifespan=lifespan)
 app.mount('/assets',StaticFiles(directory=PUBLIC),name='assets')
 
 class Data(BaseModel):
@@ -73,7 +73,7 @@ def sw():return FileResponse(PUBLIC/'sw.js',media_type='text/javascript',headers
 @app.get('/favicon.svg')
 def icon():return FileResponse(PUBLIC/'favicon.svg',media_type='image/svg+xml')
 @app.get('/api/health')
-def health():return {'ok':True,'service':'argentex-1.2','auth_configured':bool(AUTH_PASSWORD)}
+def health():return {'ok':True,'service':'argentex-1.3','auth_configured':bool(AUTH_PASSWORD)}
 @app.get('/api/auth/status')
 def auth_status(request:Request):return {'protected':bool(AUTH_PASSWORD),'authenticated':auth_ok(request)}
 @app.post('/api/login')
