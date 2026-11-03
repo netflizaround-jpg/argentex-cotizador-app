@@ -10,7 +10,8 @@ from pydantic import BaseModel, Field
 from database import init, connect, get_settings, now, new_id, all_orders, patch, invalidate_order, ensure_fields, DB_PATH
 from core import calculate_order, classify_market, D
 from fx import get_fx, refresh
-from vision import inspect_image
+from vision import inspect_images
+from photo_utils import validated_images, PhotoError, MAX_ITEM_PHOTOS, ROLES
 
 BASE = pathlib.Path(__file__).resolve().parent
 PUBLIC = BASE/'public'
@@ -36,6 +37,14 @@ class Login(BaseModel):
 
 class PhotoRequest(BaseModel):
     data_url:str
+
+class PhotoBatch(BaseModel):
+    images:list[dict]=Field(min_length=1,max_length=4)
+
+class VisionRequest(BaseModel):
+    images:list[dict]=Field(default_factory=list, max_length=4)
+    item_id:str|None=None
+    data_url:str|None=None
 
 
 def auth_token():
@@ -170,29 +179,70 @@ def update_order(oid:str,payload:Data):
         invalidate_order(db,oid)
     return {'ok':True}
 
+ITEM_FIELDS={'name','brand','sku','variant','category','unit_price_usd','qty','unit_weight_g','weight_source','weight_verified'}
+
+def _insert_photos(db,iid,images):
+    decoded=validated_images(images)
+    existing=db.execute('SELECT COUNT(*) FROM item_photos WHERE item_id=?',(iid,)).fetchone()[0]
+    if existing+len(decoded)>MAX_ITEM_PHOTOS:
+        raise HTTPException(400,'Máximo 4 fotos por producto. Eliminá una antes de agregar más.')
+    result=[]
+    for blob,mime,role in decoded:
+        pid=new_id()
+        db.execute('INSERT INTO item_photos(id,item_id,role,mime_type,data,created_at) VALUES(?,?,?,?,?,?)',(pid,iid,role,mime,blob,now()))
+        result.append({'id':pid,'role':role})
+    return result
+
+def _insert_item(db,oid,source):
+    d=ensure_fields(dict(source),ITEM_FIELDS|{'photos'})
+    # Validar todas las fotos antes de crear el artículo.
+    images=d.pop('photos',[])
+    try: validated_images(images)
+    except PhotoError as exc: raise HTTPException(400,str(exc))
+    category=d.get('category','accesorios')
+    if category not in get_settings(db)['rates_usd_kg']:raise HTTPException(400,'Categoría inválida')
+    name=str(d.get('name') or 'Producto por identificar').strip()[:300]
+    try:
+        price=float(d.get('unit_price_usd') or 0)
+        grams=int(d.get('unit_weight_g') or 0)
+        qty=int(d.get('qty') or 1)
+    except (ValueError,TypeError):raise HTTPException(400,'Datos numéricos inválidos')
+    if not (0<=price<=1000000) or not (0<=grams<=200000) or not (1<=qty<=500):
+        raise HTTPException(400,'Datos de producto inválidos')
+    iid=new_id()
+    db.execute('INSERT INTO items(id,order_id,name,brand,sku,variant,category,unit_price_usd,qty,unit_weight_g,weight_source,weight_verified,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+               (iid,oid,name,str(d.get('brand') or '')[:200],str(d.get('sku') or '')[:200],str(d.get('variant') or '')[:200],category,price,qty,grams,
+                str(d.get('weight_source') or '')[:1000],int(bool(d.get('weight_verified'))),now()))
+    added=_insert_photos(db,iid,images)
+    invalidate_order(db,oid)
+    return {'ok':True,'id':iid,'photos':added}
+
 @app.post('/api/orders/{oid}/items')
 def create_item(oid:str,payload:Data):
     with connect() as db:
         if not db.execute('SELECT id FROM orders WHERE id=?',(oid,)).fetchone():raise HTTPException(404,'Pedido inexistente')
-        category=payload.data.get('category','accesorios')
-        if category not in get_settings(db)['rates_usd_kg']:raise HTTPException(400,'Categoría inválida')
-        data=payload.data
-        name=str(data.get('name') or 'Producto por identificar').strip()
-        price=float(data.get('unit_price_usd') or 0)
-        grams=int(data.get('unit_weight_g') or 0)
-        qty=int(data.get('qty') or 1)
-        if price<0 or grams<0 or qty<1 or qty>500:raise HTTPException(400,'Datos de producto inválidos')
-        id=new_id()
-        db.execute('INSERT INTO items(id,order_id,name,brand,sku,variant,category,unit_price_usd,qty,unit_weight_g,weight_source,weight_verified,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                   (id,oid,name,str(data.get('brand') or ''),str(data.get('sku') or ''),str(data.get('variant') or ''),category,price,qty,grams,
-                    str(data.get('weight_source') or ''),int(bool(data.get('weight_verified'))),now()))
-        invalidate_order(db,oid)
-        return {'ok':True,'id':id}
+        return _insert_item(db,oid,payload.data)
+
+@app.post('/api/quick-quote')
+def quick_quote(payload:Data):
+    # Alta rápida: fotografiar primero y guardar pedido e ítem en una transacción.
+    data=payload.data
+    # _insert_item hace la validación de nombre/categoría/precio y fotos.
+    oid=new_id(); stamp=now()
+    with connect() as db:
+        title=str(data.get('name') or 'Producto por identificar').strip()[:80]
+        db.execute('INSERT INTO orders(id,customer_id,label,created_at,updated_at) VALUES(?,?,?,?,?)',
+                   (oid,None,'Cotización · '+title,stamp,stamp))
+        created=_insert_item(db,oid,data)
+        return {'ok':True,'id':created['id'],'order_id':oid,'photos':created['photos']}
 
 @app.patch('/api/items/{iid}')
 def update_item(iid:str,payload:Data):
     allowed={'name','brand','sku','variant','category','unit_price_usd','qty','unit_weight_g','weight_source','weight_verified'}
-    d=ensure_fields(payload.data,allowed)
+    d=ensure_fields(dict(payload.data),allowed|{'photos'})
+    images=d.pop('photos',[])
+    try: validated_images(images)
+    except PhotoError as exc: raise HTTPException(400,str(exc))
     with connect() as db:
         row=db.execute('SELECT order_id FROM items WHERE id=?',(iid,)).fetchone()
         if not row:raise HTTPException(404,'Producto inexistente')
@@ -202,8 +252,9 @@ def update_item(iid:str,payload:Data):
         if 'unit_price_usd' in d and float(d['unit_price_usd'])<0:raise HTTPException(400,'Precio inválido')
         if 'weight_verified' in d: d['weight_verified']=int(bool(d['weight_verified']))
         patch(db,'items',iid,d,allowed)
+        added=_insert_photos(db,iid,images)
         invalidate_order(db,row['order_id'])
-    return {'ok':True}
+    return {'ok':True,'photos':added}
 
 @app.delete('/api/items/{iid}')
 def delete_item(iid:str):
@@ -214,26 +265,56 @@ def delete_item(iid:str):
         invalidate_order(db,row['order_id'])
     return {'ok':True}
 
+@app.post('/api/items/{iid}/photos')
+def add_photos(iid:str,payload:PhotoBatch):
+    with connect() as db:
+        item=db.execute('SELECT order_id FROM items WHERE id=?',(iid,)).fetchone()
+        if not item:raise HTTPException(404,'Producto inexistente')
+        try: added=_insert_photos(db,iid,payload.images)
+        except PhotoError as exc:raise HTTPException(400,str(exc))
+        invalidate_order(db,item['order_id'])
+        return {'ok':True,'photos':added}
+
+@app.get('/api/items/{iid}/photos/{pid}')
+def get_item_photo(iid:str,pid:str):
+    with connect() as db:
+        photo=db.execute('SELECT data,mime_type FROM item_photos WHERE id=? AND item_id=?',(pid,iid)).fetchone()
+        if not photo:raise HTTPException(404,'Foto no encontrada')
+        return Response(bytes(photo['data']),media_type=photo['mime_type'],headers={'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'})
+
+@app.delete('/api/items/{iid}/photos/{pid}')
+def delete_item_photo(iid:str,pid:str):
+    with connect() as db:
+        item=db.execute('SELECT order_id FROM items WHERE id=?',(iid,)).fetchone()
+        if not item:raise HTTPException(404,'Producto inexistente')
+        cur=db.execute('DELETE FROM item_photos WHERE id=? AND item_id=?',(pid,iid))
+        if not cur.rowcount:raise HTTPException(404,'Foto no encontrada')
+        invalidate_order(db,item['order_id'])
+    return {'ok':True}
+
+@app.patch('/api/items/{iid}/photos/{pid}')
+def update_item_photo(iid:str,pid:str,payload:Data):
+    d=ensure_fields(payload.data,{'role'})
+    if d.get('role') not in ROLES:raise HTTPException(400,'Tipo de foto inválido')
+    with connect() as db:
+        item=db.execute('SELECT order_id FROM items WHERE id=?',(iid,)).fetchone()
+        if not item:raise HTTPException(404,'Producto inexistente')
+        cur=db.execute('UPDATE item_photos SET role=? WHERE id=? AND item_id=?',(d['role'],pid,iid))
+        if not cur.rowcount:raise HTTPException(404,'Foto no encontrada')
+        invalidate_order(db,item['order_id'])
+    return {'ok':True}
+
+# Compatibilidad temporal con lectores de la versión 1.3.
 @app.post('/api/items/{iid}/photo')
 def save_photo(iid:str,payload:PhotoRequest):
-    data=payload.data_url
-    if not data.startswith(('data:image/jpeg;base64,','data:image/png;base64,','data:image/webp;base64,')) or len(data)>7_000_000:
-        raise HTTPException(400,'Foto inválida (máximo ~5 MB)')
-    try: photo=base64.b64decode(data.split(',',1)[1],validate=True)
-    except Exception:raise HTTPException(400,'Imagen inválida')
-    with connect() as db:
-        cur=db.execute('UPDATE items SET photo=? WHERE id=?',(photo,iid))
-        if not cur.rowcount:raise HTTPException(404,'Producto inexistente')
-    return {'ok':True}
+    return add_photos(iid,PhotoBatch(images=[{'data_url':payload.data_url,'role':'producto'}]))
 
 @app.get('/api/items/{iid}/photo')
 def get_photo(iid:str):
     with connect() as db:
-        x=db.execute('SELECT photo FROM items WHERE id=?',(iid,)).fetchone()
-        if not x or not x['photo']:raise HTTPException(404,'Foto no encontrada')
-        data=x['photo']
-        mime='image/png' if data.startswith(b'\x89PNG') else 'image/webp' if data.startswith(b'RIFF') else 'image/jpeg'
-        return Response(data,media_type=mime,headers={'Cache-Control':'private, max-age=300'})
+        photo=db.execute('SELECT data,mime_type FROM item_photos WHERE item_id=? ORDER BY rowid ASC LIMIT 1',(iid,)).fetchone()
+        if not photo:raise HTTPException(404,'Foto no encontrada')
+        return Response(bytes(photo['data']),media_type=photo['mime_type'],headers={'Cache-Control':'private, no-store'})
 
 @app.post('/api/items/{iid}/market')
 def create_market(iid:str,payload:Data):
@@ -298,10 +379,22 @@ def manual_fx(payload:Data):
     return {'ok':True,'manual':True}
 
 @app.post('/api/vision')
-def vision(payload:PhotoRequest):
-    try:return inspect_image(payload.data_url)
-    except ValueError as e:raise HTTPException(400,str(e))
-    except Exception:raise HTTPException(502,'No fue posible analizar la fotografía. Ingresá los datos manualmente.')
+def vision(payload:VisionRequest):
+    images=list(payload.images)
+    if payload.data_url:images.append({'data_url':payload.data_url,'role':'producto'})
+    if payload.item_id:
+        with connect() as db:
+            item=db.execute('SELECT id FROM items WHERE id=?',(payload.item_id,)).fetchone()
+            if not item:raise HTTPException(404,'Producto inexistente')
+            stored=db.execute('SELECT data,mime_type,role FROM item_photos WHERE item_id=? ORDER BY rowid ASC',(payload.item_id,)).fetchall()
+            from_stored=[{'data_url':f'data:{x["mime_type"]};base64,'+base64.b64encode(x['data']).decode(),'role':x['role']} for x in stored]
+            images=from_stored+images
+    if not images or len(images)>4:raise HTTPException(400,'Se requieren entre 1 y 4 fotografías del mismo producto.')
+    try:
+        validated_images(images)
+        return inspect_images(images)
+    except (ValueError,PhotoError) as exc:raise HTTPException(400,str(exc))
+    except Exception:raise HTTPException(502,'No fue posible analizar las fotos. Revisá los datos manualmente.')
 
 @app.post('/api/orders/{oid}/approve')
 def approve(oid:str):

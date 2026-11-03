@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK (id = 1), cont
 CREATE TABLE IF NOT EXISTS customers (id TEXT PRIMARY KEY, full_name TEXT NOT NULL, phone TEXT NOT NULL DEFAULT '', notes TEXT DEFAULT '', created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, customer_id TEXT REFERENCES customers(id) ON DELETE SET NULL, label TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft', outer_packaging_g INTEGER NOT NULL DEFAULT 0, tax_mode TEXT NOT NULL DEFAULT 'not_applicable', tax_rate REAL NOT NULL DEFAULT 0, us_shipping_override REAL, import_extra_usd REAL NOT NULL DEFAULT 0, notes TEXT DEFAULT '', price_override_usd REAL, approved_at TEXT, approved_fx_ars REAL, approved_sell_usd REAL, approved_cost_usd REAL, tax_reviewed INTEGER NOT NULL DEFAULT 0, import_cost_reviewed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE, name TEXT NOT NULL, brand TEXT DEFAULT '', sku TEXT DEFAULT '', variant TEXT DEFAULT '', category TEXT NOT NULL, unit_price_usd REAL NOT NULL DEFAULT 0, qty INTEGER NOT NULL DEFAULT 1, unit_weight_g INTEGER NOT NULL DEFAULT 0, weight_source TEXT DEFAULT '', weight_verified INTEGER NOT NULL DEFAULT 0, photo BLOB, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS item_photos (id TEXT PRIMARY KEY, item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, role TEXT NOT NULL DEFAULT 'detalle', mime_type TEXT NOT NULL, data BLOB NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS market (id TEXT PRIMARY KEY, item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, source_name TEXT NOT NULL, source_url TEXT NOT NULL, price_ars REAL NOT NULL, shipping_ars REAL NOT NULL DEFAULT 0, same_sku INTEGER NOT NULL DEFAULT 0, brand_new INTEGER NOT NULL DEFAULT 0, original INTEGER NOT NULL DEFAULT 0, in_stock INTEGER NOT NULL DEFAULT 0, reputation_ok INTEGER NOT NULL DEFAULT 0, payment_verified INTEGER NOT NULL DEFAULT 0, shipping_verified INTEGER NOT NULL DEFAULT 0, conditions_note TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fx_quotes (label TEXT PRIMARY KEY, sell_ars REAL NOT NULL, source_url TEXT NOT NULL, updated_at TEXT NOT NULL, fetched_at TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'api');
 '''
@@ -95,6 +96,16 @@ def init():
         columns={r['name'] for r in db.execute('PRAGMA table_info(orders)')}
         for name,sql in {'approved_sell_usd':'REAL','approved_cost_usd':'REAL','tax_reviewed':'INTEGER NOT NULL DEFAULT 0','import_cost_reviewed':'INTEGER NOT NULL DEFAULT 0'}.items():
             if name not in columns: db.execute(f'ALTER TABLE orders ADD COLUMN {name} {sql}')
+        # Migración no destructiva: la imagen original de v1.3 pasa a la galería.
+        # Se mantienen fotos originales durante la migración; el cambio es atómico.
+        db.execute('''INSERT INTO item_photos(id,item_id,role,mime_type,data,created_at)
+            SELECT lower(hex(randomblob(8))),i.id,'producto',
+               CASE WHEN substr(i.photo,1,8)=X'89504E470D0A1A0A' THEN 'image/png'
+                    WHEN substr(i.photo,1,4)=X'52494646' THEN 'image/webp'
+                    ELSE 'image/jpeg' END,
+               i.photo, i.created_at FROM items AS i
+            WHERE i.photo IS NOT NULL AND NOT EXISTS(SELECT 1 FROM item_photos AS p WHERE p.item_id=i.id)''')
+        db.execute('UPDATE items SET photo=NULL WHERE photo IS NOT NULL')
         market_cols={r['name'] for r in db.execute('PRAGMA table_info(market)')}
         for name,sql in {'reputation_ok':'INTEGER NOT NULL DEFAULT 0','payment_verified':'INTEGER NOT NULL DEFAULT 0','shipping_verified':'INTEGER NOT NULL DEFAULT 0','conditions_note':"TEXT NOT NULL DEFAULT ''"}.items():
             if name not in market_cols: db.execute(f'ALTER TABLE market ADD COLUMN {name} {sql}')
@@ -108,6 +119,8 @@ def all_orders(db):
     for order in orders:
         order['items']=[row(x) for x in db.execute('SELECT id,order_id,name,brand,sku,variant,category,unit_price_usd,qty,unit_weight_g,weight_source,weight_verified,photo IS NOT NULL as has_photo, created_at FROM items WHERE order_id=? ORDER BY created_at ASC', (order['id'],))]
         for item in order['items']:
+            item['photos']=[row(x) for x in db.execute('SELECT id,role,mime_type,created_at FROM item_photos WHERE item_id=? ORDER BY rowid ASC',(item['id'],))]
+            item['has_photo']=bool(item['photos']) or bool(item['has_photo'])
             item['market']=[row(x) for x in db.execute('SELECT * FROM market WHERE item_id=? ORDER BY observed_at DESC',(item['id'],))]
     return orders
 

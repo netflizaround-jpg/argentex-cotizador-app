@@ -88,3 +88,17 @@ python -m pytest tests -q
 2. Agentes de búsqueda para peso embalada de fabricante y tiendas argentinas con fuentes y confianza.
 3. Futuro backend Postgres, restauración automatizada de respaldos y cuentas con roles; Render HTTPS y respaldo descargable ya preparados en 1.1.
 4. Auditoría por cambio y snapshots de precio/dólar al momento del pago.
+
+## Versión 1.4 — carga de hasta cuatro fotos en iPhone
+
+Se corrigió el controlador de clics que interceptaba el evento nativo de los botones de cámara y envío de formularios en Safari. La captura ahora utiliza un `<input type="file" accept="image/*" capture="environment">` **real y accionado directamente** (superpuesto al botón, no oculto con `display:none` ni abierto con `.click()`). La opción **Elegir de Fotos** permite varias imágenes por selección.
+
+- Inicio → **Fotografiar o cargar producto** abre directamente la ficha del producto, sin crear primero el pedido. Luego de guardar, se crea el borrador con el producto y las fotos en una sola transacción.
+- Hasta **cuatro fotos por producto**: frente/producto, etiqueta o SKU, cartel de precio, presentación u otros detalles. El usuario puede cambiar la etiqueta de cada foto, quitarla, añadir otras y conservar las fotos ya guardadas al editar el artículo.
+- Una captura nueva en Safari no reemplaza a las anteriores: las fotografías se acumulan en `pendingPhotos` y se envían al servidor al guardar. Al elegir varias desde Fotos, se respetan los lugares restantes.
+- Cada imagen se redimensiona a un máximo de 1600 px y se comprime a JPEG antes de transferir; máximo 2,5 MB por foto y cuatro por producto. Se valida el tipo real de los archivos en el backend.
+- SQLite agrega la tabla `item_photos`, manteniendo una migración desde la antigua columna `items.photo`. Los backups completos y el respaldo a Neon incluyen las nuevas fotografías.
+- Cuando `OPENAI_API_KEY` está configurada, la integración opcional recibe las **cuatro imágenes juntas**, sus roles y las analiza para extraer únicamente nombre, marca, modelo, SKU, variante y **precio en USD legible**, señalando dudas. Sin clave API, se guardan las fotos y el usuario puede completar los datos manualmente; no se inventan valores.
+- Las fotografías no verifican por sí solas pesos, autenticidad, impuestos o precios comparables en Argentina; las reglas comerciales previas no cambian.
+
+**Prueba móvil:** Safari en un iPhone → abrir la URL HTTPS → tocar «Fotografiar o cargar producto» → «Sacar foto» → sacar 3 o 4 fotos una por vez (o seleccionar varias de Fotos) → comprobar las miniaturas → guardar. Si el dispositivo había instalado la app, refrescar Safari para obtener el nuevo paquete PWA.
